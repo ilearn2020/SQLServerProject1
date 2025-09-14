@@ -329,16 +329,82 @@ SELECT LEN('Hello'), UPPER('hello'), LOWER('HELLO'), LTRIM('  hi  '), RTRIM('hi 
 SELECT ISNULL(NULL, 'Default'), COALESCE(NULL, NULL, 'FirstNotNull');
 
 
+-- Cursor
+-- cursors are nor updatable when
+-- declared as READ_ONLY, FAST_FORWARD, STATIC (DYNAMIC and KEYSET are updatable)
+-- the SELECT Query is Non-Updatable (use FOR UPDATE OF to make updatable):
+    --Query uses a JOIN (multiple tables)
+    --Query has DISTINCT, GROUP BY, HAVING, UNION, ORDER BY.
+    --Query references a view without an INSTEAD OF trigger.
+    --Query selects from a read-only database or filegroup.
+    --Query includes computed columns, aggregate functions, or subqueries.
+
+DECLARE myCursor CURSOR LOCAL FAST_FORWARD FOR SELECT EmployeeID, Salary FROM Employees;
+-- Use LOCAL FAST_FORWARD cursors for efficiency, not updatable, fastest
+-- Forward-only: Default, can only move forward.
+-- Static: Takes a snapshot, no changes visible. Can scroll forward and backward
+-- Dynamic: Reflects changes in underlying data. Can scroll forward and backward
+-- Keyset: Fixed set of rows, but values can change.
+    -- Creates a set of keys (primary keys/unique identifiers) at cursor open time.
+    -- Membership of rows is fixed → new inserts won’t appear, deletes are removed.
+    -- But updates to existing rows are visible.
+    -- Can scroll forward and backward.
+OPEN myCursor;
+FETCH NEXT FROM myCursor INTO @EmpID, @Salary;
+-- Can FETCH NEXT/PREVIOUS/FIRST/LAST
+WHILE @@FETCH_STATUS = 0  -- (0 = success, -1 = no row, -2 = row missing).
+BEGIN
+    -- Do something with @EmpID, @Salary
+    FETCH NEXT FROM myCursor INTO @EmpID, @Salary;
+END
+CLOSE myCursor;  --release current result set
+DEALLOCATE myCursor;  --free resources
+
+
+-- Updating cursor
+DECLARE cur CURSOR KEYSET FOR
+SELECT e.EmployeeID, e.Salary
+FROM Employees e
+JOIN Departments d ON e.DepartmentID = d.DepartmentID
+FOR UPDATE OF Salary;   -- Need FOR UPDATE if
+                        -- Query is not updatable and you want to use WHERE CURRENT OF
+                        -- When you want to restrict which columns 
+                        -- (If FOR UPDATE without the column list, all columns in the cursor may be updatable)
+OPEN cur;
+
+-- Update using WHERE CURRENT OF, nice but only works with updatable cursor
+FETCH NEXT FROM cur;
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    UPDATE Employees SET Salary = Salary * 1.10 WHERE CURRENT OF cur;   -- ✅ Works if FOR UPDATE but fails without it
+    FETCH NEXT FROM cur;
+END
+
+-- Alternately, update using PK, works with any cursor type
+DECLARE @EmpID INT, @Sal DECIMAL(10,2);
+FETCH NEXT FROM cur INTO @EmpID, @Sal;
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    -- Update using the primary key instead of CURRENT OF
+    UPDATE Employees SET Salary = Salary * 1.10 WHERE EmployeeID = @EmpID;
+    FETCH NEXT FROM cur INTO @EmpID, @Sal;
+END
+
+CLOSE cur;
+DEALLOCATE cur;
+
+
+
+
 /*
-How Nested Transactions Work in SQL Server
+Nested Transactions
+===================
 SQL Server doesn’t support true nested transactions (like Oracle).
 Each BEGIN TRAN increments a counter: @@TRANCOUNT.
 Each COMMIT TRAN decrements the counter.
 But ROLLBACK TRAN resets @@TRANCOUNT to 0, no matter how many nested levels you had.
 So there’s really only one transaction scope — nesting is only a counter illusion.
-*/
 
-/*
 Pattern: Only the Outer Procedure Controls the Transaction
 Outer procedure is responsible for starting, committing, or rolling back the transaction.
 If you need an inner procedure to undo only its own work without affecting outer work,
@@ -346,38 +412,67 @@ use SAVE TRANSACTION savepoint_name and ROLLBACK TRANSACTION savepoint_name.
 */
 
 
+/*
+Error Categories
+================
+1. Statement-terminating errors: Only the current statement fails.
+Examples: Constraint violation, zero div (8134), conv error (245), RAISERROR with severity 11–19
+Note on RAISERROR with severity 11–19: Considered user-correctable runtime errors. SQL Server treats them the same as other runtime
+statement-terminating errors like PK/FK violations, divide-by-zero.
+
+BEGIN TRY
+    BEGIN TRAN;
+    INSERT INTO Orders(OrderID, CustomerID) VALUES (1, 9999); -- invalid FK
+    COMMIT;
+END TRY
+BEGIN CATCH
+    SELECT @@TRANCOUNT AS TranCount, XACT_STATE() AS TranState;
+END CATCH;
+
+Flow: The batch continues unless you’re in a TRY…CATCH, in which case control moves to CATCH.
+Transaction: If inside an explicit transaction:
+With XACT_ABORT ON → the entire transaction is rolled back automatically.
+    @@TRANCOUNT = 1 (transaction closed), XACT_STATE() = 0 (no active transaction)
+With XACT_ABORT OFF → transaction remains active, but may be in an uncommittable state (XACT_STATE() = -1).
+    @@TRANCOUNT = 1 (transaction still open), XACT_STATE() = -1 (uncommittable, must ROLLBACK)
+--------------------------------------------------------------------------------------------------------------------------------
+2. Batch-aborting / transaction-aborting errors: End not just the statement, but the entire batch or the active transaction.
+Examples:
+Syntax errors (compile time) SELEX * FROM ...: Query never makes it into execution — SQL Server fails before the TRY block can start.
+Deferred name resolution errors (execution time) SELECT BadColumn FROM dbo.Employees: Considered a compile-time/batch-abort, not a run-time error.
+Errors that explicitly abort a batch: DBCC CHECKIDENT with bad arguments, Some SET options invalid in context, KILL command
+Severe constraint metadata corruption, Explicit SET OFFSETS/COMPILE issues
+
+SET XACT_ABORT OFF; -- or ON
+BEGIN TRY
+    BEGIN TRAN;
+    SELECT BadColumn FROM Employees; -- invalid column
+    COMMIT;
+END TRY
+BEGIN CATCH --@@TRANCOUNT stays as-is, but you never reach CATCH to check it
+    SELECT @@TRANCOUNT AS TranCount, XACT_STATE() AS TranState;
+    ROLLBACK;
+END CATCH;
+
+Flow: Control does not pass to CATCH in some cases (batch stops immediately)
+Transaction: XACT_ABORT doesn’t apply, ON and OFF the same. The batch aborts immediately. @@TRANCOUNT stays as-is, but you never reach CATCH to check it
+Connection may remain alive or may be killed, depending on severity.
+--------------------------------------------------------------------------------------------------------------------------------
+3. Connection-terminating (Severity ≥ 20)
+Example: serious system-level error, network, RAISERROR('Fatal error', 20, 1) WITH LOG; -- sysadmin required
+Flow: Kill the entire session/connection. No CATCH possible — session ends immediately.
+Transaction: Rolled back automatically by SQL Server engine.
+
+Summary of interaction with CATCH
+Statement-terminating errors → If no TRY CATCH, continue, otherwise jump to CATCH block.
+Batch-aborting errors → Skip CATCH, batch stops immediately.
+Connection-terminating errors → No chance for CATCH, connection gone.
+*/
 
 -- error handling
 -- Before SQL Server 2005, you had to check @@ERROR after every statement.
 -- Don’t use it in new code — TRY…CATCH is much better.
 -- try catch 
-
-BEGIN TRANSACTION;
-
--- Before SQL Server 2005
-UPDATE Employees SET Salary = Salary * 1.1 WHERE DepartmentID = 2;
-IF @@ERROR <> 0
-    ROLLBACK TRANSACTION;
-ELSE
-    COMMIT TRANSACTION;
-
--- Now use TRY CATCH and SET XACT_ABORT ON
--- Best Practice Template
-SET XACT_ABORT ON;  -- should use this, rollback automatically on error
-                    -- SET XACT_ABORT is a session-level setting, not local to a procedure
-BEGIN TRY
-    BEGIN TRAN;
-    -- your work
-    COMMIT;
-END TRY
-BEGIN CATCH
-    SELECT ERROR_NUMBER() AS ErrNum,
-        ERROR_MESSAGE() AS ErrMsg,
-        ERROR_LINE() AS ErrLine;
-    IF @@TRANCOUNT > 0
-        ROLLBACK;   -- still needed!
-    THROW;          -- rethrow for caller
-END CATCH
 
 /*
 With XACT_ABORT ON, when an error occurs inside a TRY, SQL Server:
@@ -387,7 +482,14 @@ By the time your code runs inside CATCH, the transaction is already gone (@@TRAN
 */
 
 /*
-SET XACT_ABORT ON
+With XACT_ABORT OFF: FK violation jumps to CATCH.
+Transaction is still open → you must ROLLBACK (because it’s in an “uncommittable” state: XACT_STATE() = -1).
+With XACT_ABORT ON: FK violation also jumps to CATCH.
+But SQL Server already rolled back the transaction before entering CATCH (@@TRANCOUNT = 0).
+*/
+
+/*
+XACT_ABORT ON
     Errors that it rolls back:
         Divide by zero, Arithmetic overflow, Conversion errors (e.g., CAST('abc' AS INT))
         Constraint violations (primary key, foreign key, check)
@@ -420,6 +522,37 @@ Errors that it does not roll back:
     login errors
 */
 
+BEGIN TRANSACTION;
+
+-- Before SQL Server 2005
+UPDATE Employees SET Salary = Salary * 1.1 WHERE DepartmentID = 2;
+IF @@ERROR <> 0
+    ROLLBACK TRANSACTION;
+ELSE
+    COMMIT TRANSACTION;
+
+-- Now use TRY CATCH and SET XACT_ABORT ON
+-- Best Practice Template
+SET XACT_ABORT ON;  -- should use this, rollback automatically on error
+                    -- Without XACT_ABORT ON, behavior depends on the type of error (some abort immediately, some don’t).
+                    -- With XACT_ABORT ON, all run-time errors behave the same way: rollback + jump to CATCH.
+                    -- SET XACT_ABORT is a session-level setting, not local to a procedure
+BEGIN TRY
+    BEGIN TRAN;
+    -- your work
+    COMMIT;
+END TRY
+BEGIN CATCH
+    SELECT ERROR_NUMBER() AS ErrNum,
+        ERROR_MESSAGE() AS ErrMsg,
+        ERROR_LINE() AS ErrLine;
+    IF @@TRANCOUNT > 0
+        ROLLBACK;   -- still needed!
+    THROW;          -- rethrow for caller
+END CATCH
+GO
+
+
 
 -- Error handling template
 CREATE PROCEDURE TransferFunds
@@ -429,35 +562,6 @@ CREATE PROCEDURE TransferFunds
 AS
 BEGIN
     SET XACT_ABORT ON; -- should use this, rollback automatically on error
-    --SET XACT_ABORT is a session-level setting, not local to a procedure
-    --1. Errors that XACT_ABORT DOES roll back automatically: Most runtime T-SQL errors:
-    --Divide by zero
-    --Arithmetic overflow
-    --Constraint violations (primary key, foreign key, check)
-    --Deadlock victim
-    --Conversion errors (e.g., CAST('abc' AS INT))
-    --Explicit THROW inside a transaction
-    --2. Errors that XACT_ABORT does NOT roll back automatically
-    --These errors terminate the batch or connection, or occur outside the scope of the transaction, and XACT_ABORT does not automatically roll back:
-    --Compile-time errors
-    --Syntax errors
-    --Invalid object/column names at creation time
-    --Missing keywords
-    --SELECT * FROM NonExistentTable; -- compile-time error
-    --Some statement-level batch-aborting errors
-    --USE master; inside a transaction (certain context switches)
-    --Certain permission or login errors
-    --Errors that terminate the connection
-    --Network-level errors
-    --Severe system-level errors (severity 20+)
-    --E.g., memory allocation failure
-    --Explicit RAISERROR with severity 10 or below. These are informational messages, not considered run-time errors, so no rollback occurs.
-
-
-
-    --Any run-time error (like constraint violation, arithmetic overflow, deadlock victim, divide-by-zero)
-    --will cause SQL Server to automatically roll back the entire transaction.
-
     --Why XACT_ABORT ON Matters Even with a CATCH Rollback:
     --0. Error Consistency
     --Without XACT_ABORT ON, behavior depends on the type of error (some abort immediately, some don’t).
@@ -620,6 +724,7 @@ BEGIN
         THROW;
     END CATCH
 END;
+GO
 
 --Detect if Caller Already Has a Transaction
 -- Sometimes you want a procedure to optionally join a caller’s transaction. Use @@TRANCOUNT to detect
@@ -648,67 +753,95 @@ BEGIN
         THROW;
     END CATCH
 END;
+GO
 
--- Cursor
--- cursors are nor updatable when
--- declared as READ_ONLY, FAST_FORWARD, STATIC (DYNAMIC and KEYSET are updatable)
--- the SELECT Query is Non-Updatable (use FOR UPDATE OF to make updatable):
-    --Query uses a JOIN (multiple tables)
-    --Query has DISTINCT, GROUP BY, HAVING, UNION, ORDER BY.
-    --Query references a view without an INSTEAD OF trigger.
-    --Query selects from a read-only database or filegroup.
-    --Query includes computed columns, aggregate functions, or subqueries.
+/*
+Reporting error
+Best Practice Pattern for Nested Procedures
+Inner Procedure (B)
+Use SAVE TRANSACTION instead of starting its own transaction.
+Roll back only its part if something goes wrong.
+Rethrow the error for the caller to decide final handling.
+Outer Procedure (A)
+Responsible for the real transaction scope.
+Calls inner procs, lets them rethrow errors.
+On error, it performs full rollback and returns a meaningful message to the client.
+*/
 
-DECLARE myCursor CURSOR LOCAL FAST_FORWARD FOR SELECT EmployeeID, Salary FROM Employees;
--- Use LOCAL FAST_FORWARD cursors for efficiency, not updatable, fastest
--- Forward-only: Default, can only move forward.
--- Static: Takes a snapshot, no changes visible. Can scroll forward and backward
--- Dynamic: Reflects changes in underlying data. Can scroll forward and backward
--- Keyset: Fixed set of rows, but values can change.
-    -- Creates a set of keys (primary keys/unique identifiers) at cursor open time.
-    -- Membership of rows is fixed → new inserts won’t appear, deletes are removed.
-    -- But updates to existing rows are visible.
-    -- Can scroll forward and backward.
-OPEN myCursor;
-FETCH NEXT FROM myCursor INTO @EmpID, @Salary;
--- Can FETCH NEXT/PREVIOUS/FIRST/LAST
-WHILE @@FETCH_STATUS = 0  -- (0 = success, -1 = no row, -2 = row missing).
+CREATE PROCEDURE ProcB AS
 BEGIN
-    -- Do something with @EmpID, @Salary
-    FETCH NEXT FROM myCursor INTO @EmpID, @Salary;
-END
-CLOSE myCursor;  --release current result set
-DEALLOCATE myCursor;  --free resources
+    SET XACT_ABORT ON;
 
+    SAVE TRANSACTION ProcBSave;  -- marks rollback point
 
--- Updating cursor
-DECLARE cur CURSOR KEYSET FOR
-SELECT e.EmployeeID, e.Salary
-FROM Employees e
-JOIN Departments d ON e.DepartmentID = d.DepartmentID
-FOR UPDATE OF Salary;   -- Need FOR UPDATE if
-                        -- Query is not updatable and you want to use WHERE CURRENT OF
-                        -- When you want to restrict which columns 
-                        -- (If FOR UPDATE without the column list, all columns in the cursor may be updatable)
-OPEN cur;
+    BEGIN TRY
+        -- Some risky DML
+        UPDATE Accounts SET Balance = Balance - 100 WHERE AccID = 1;
+        UPDATE Accounts SET Balance = Balance + 100 WHERE AccID = 999; -- bad FK
+    END TRY
+    BEGIN CATCH
+        ROLLBACK TRANSACTION ProcBSave;  -- undo only this part
+        THROW;  -- bubble up error
+    END CATCH
+END;
+GO
 
--- Update using WHERE CURRENT OF, nice but only works with updatable cursor
-FETCH NEXT FROM cur;
-WHILE @@FETCH_STATUS = 0
+CREATE PROCEDURE ProcA AS
 BEGIN
-    UPDATE Employees SET Salary = Salary * 1.10 WHERE CURRENT OF cur;   -- ✅ Works if FOR UPDATE but fails without it
-    FETCH NEXT FROM cur;
-END
+    SET XACT_ABORT ON;
 
--- Alternately, update using PK, works with any cursor type
-DECLARE @EmpID INT, @Sal DECIMAL(10,2);
-FETCH NEXT FROM cur INTO @EmpID, @Sal;
-WHILE @@FETCH_STATUS = 0
-BEGIN
-    -- Update using the primary key instead of CURRENT OF
-    UPDATE Employees SET Salary = Salary * 1.10 WHERE EmployeeID = @EmpID;
-    FETCH NEXT FROM cur INTO @EmpID, @Sal;
-END
+    BEGIN TRY
+        BEGIN TRANSACTION;
 
-CLOSE cur;
-DEALLOCATE cur;
+        EXEC ProcB;   -- inner work
+        EXEC ProcC;   -- another inner proc
+
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0
+            ROLLBACK TRANSACTION;
+
+        DECLARE 
+            @ErrMsg NVARCHAR(4000),
+            @ErrSeverity INT,
+            @ErrState INT;
+
+        SELECT 
+            @ErrMsg = ERROR_MESSAGE(),
+            @ErrSeverity = ERROR_SEVERITY(),
+            @ErrState = ERROR_STATE();
+
+        -- Return a meaningful message to client
+        THROW 50001, 'Transfer failed: ' + @ErrMsg, 1;
+    END CATCH
+END;
+
+CREATE TABLE ErrorCatalog (
+    ErrorCode INT PRIMARY KEY,
+    ErrorName SYSNAME NOT NULL,
+    ErrorMessage NVARCHAR(2048) NOT NULL
+);
+
+INSERT INTO ErrorCatalog VALUES
+(50001, 'InsufficientFunds', 'Transfer failed: insufficient funds.'),
+(50002, 'InvalidAccount',    'Transfer failed: account not found.');
+
+/*
+public enum SqlErrorCodes
+{
+    InsufficientFunds = 50001,
+    InvalidAccount = 50002
+}
+
+catch (SqlException ex) when (ex.Number == (int)SqlErrorCodes.InsufficientFunds)
+{
+    // handle business logic
+}
+
+For large systems → maintain a central ErrorCatalog in the database + application-level constants.
+
+For small systems → at least reserve a number range and keep constants in app code.
+
+Never scatter THROW 50001, '...' everywhere — that’s a maintenance headache.
+*/
